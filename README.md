@@ -1,5 +1,5 @@
 # MMF
-This repository is the official implementation of "A Masked Mixture Model for More Compact and Accurate Matrix Factorization."
+This repository is the official implementation of "A Masked Mixture Model for Compact and Accurate Matrix Factorization."
 
 
 ## Abstract
