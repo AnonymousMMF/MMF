@@ -107,9 +107,3 @@ If you pass `--reorder`, it uses the Hungarian algorithm (requires SciPy) to cor
 
 ---
 
-## 7) Reproducibility
-
-All scripts accept seeds (`--seed` or seed variants) and use deterministic seeding utilities where applicable.
-
----
-
