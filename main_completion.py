@@ -1,25 +1,20 @@
-# main_completion.py
-# ------------------------------------------------------------
-# Unified MF vs MMF benchmark:
-#   - MovieLens: ml-100k / ml-1m / ml-10m
-#   - Flixster / Douban: common preprocessed split used by GC-MC line of work
-#
-# Run examples:
-#   # MovieLens
-#   python main_completion.py --dataset ml-100k --download --R 64 --K 3 --device cuda
-#   python main_completion.py --dataset ml-10m  --download --R 128 --K 8 --device cuda
-#
-#   # Flixster / Douban (fixed train/test from mgcnn .mat)
-#   python main_completion.py --dataset flixster --download --R 64 --K 3 --device cuda
-#   python main_completion.py --dataset douban   --download --R 64 --K 3 --device cuda
-#
-#   # SHIFT LEARNING
-#   python main_completion.py --dataset douban --download --R 256 --K 42 --device cuda \
-#       --shift_mode learned --shift_init zero --lr_shifts 5e-2
-#
-#   python main_completion.py --dataset flixster --download --R 256 --K 42 --device cuda \
-#       --shift_mode learned --shift_init random --shift_std 0.1 --lr_shifts 5e-2
-# ------------------------------------------------------------
+"""
+main_completion.py
+
+Unified MF vs. MMF benchmark for explicit-rating matrix completion.
+
+Supported datasets:
+  - MovieLens: ml-100k / ml-1m / ml-10m (from GroupLens)
+  - Flixster / Douban: fixed train/test splits from the GC-MC/MGCNN preprocessing (.mat)
+
+Example:
+  python main_completion.py --dataset ml-1m --download --R 1200 --K 64 --device cuda
+
+Outputs (saved under --save_dir):
+  - Per-seed JSON: <dataset>_R{R}_K{K}_seed{seed}.json
+  - Aggregate JSON: <dataset>_R{R}_K{K}_agg.json
+  - Optional training curve PNG: <dataset>_curves_R{R}_K{K}_seed{seed}.png (enable with --plot_curves)
+"""
 
 import argparse
 import math
@@ -45,7 +40,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def count_params(model: nn.Module) -> int:
@@ -78,9 +74,10 @@ def download_url(url: str, dst_path: str):
 
 
 def unzip_if_needed(zip_path: str, extract_to: str, sentinel_dir: Optional[str] = None):
-    """
-    - sentinel_dir이 존재하면 이미 풀린 것으로 간주
-    - sentinel_dir이 None이면, extract_to가 비어있지 않으면 이미 풀린 것으로 간주
+    """Unzip a file if extraction is not already done.
+
+    If ``sentinel_dir`` is provided and exists, we assume the archive has already been extracted.
+    Otherwise, if ``extract_to`` is non-empty, we also assume extraction is done.
     """
     if sentinel_dir is not None and os.path.isdir(sentinel_dir):
         return
@@ -136,7 +133,7 @@ def download_and_extract_movielens(dataset: str, data_dir: str) -> str:
     if not os.path.isdir(extract_dir):
         download_url(url, zip_path)
 
-        tmp_extract = os.path.join(data_dir, f"_{dataset}_tmp")
+        tmp_extract = os.path.join(data_dir, f"{dataset}")
         if os.path.isdir(tmp_extract):
             _rm_tree(tmp_extract)
 
@@ -261,7 +258,7 @@ def download_and_extract_mgcnn(data_dir: str) -> str:
     sentinel = os.path.join(data_dir, "mgcnn-master")
     unzip_if_needed(zip_path, data_dir, sentinel_dir=sentinel)
 
-    # GitHub zip이 branch명에 따라 mgcnn-master 대신 mgcnn-main 등으로 풀릴 수도 있으니 보정
+    # GitHub ZIPs may extract into folders like "mgcnn-main" or "mgcnn-master"; normalize the folder name.
     if os.path.isdir(sentinel):
         return sentinel
 
@@ -548,7 +545,7 @@ class MMF(nn.Module):
         else:
             self.register_buffer("w", self._precompute_w(device=device))  # (K, R)
 
-    def _mask_fn(self, delta: torch.Tensor, mode: str) -> torch.Tensor:  # TODO
+    def _mask_fn(self, delta: torch.Tensor, mode: str) -> torch.Tensor:
         if mode == "psin":
             return (torch.sin(math.pi * delta) + 2.5) / 5
         if mode == "pcos":
@@ -751,7 +748,7 @@ def train_model(
 
 
 def make_loaders(u_tr, i_tr, r_tr, u_va, i_va, r_va, u_te, i_te, r_te,
-                 batch_size: int, num_workers: int = 0):
+                 batch_size: int, num_workers: int = 0, pin_memory: bool = False):
     def to_tensor(x, dtype): return torch.tensor(x, dtype=dtype)
 
     train_ds = TensorDataset(to_tensor(u_tr, torch.long), to_tensor(i_tr, torch.long), to_tensor(r_tr, torch.float32))
@@ -759,11 +756,11 @@ def make_loaders(u_tr, i_tr, r_tr, u_va, i_va, r_va, u_te, i_te, r_te,
     test_ds = TensorDataset(to_tensor(u_te, torch.long), to_tensor(i_te, torch.long), to_tensor(r_te, torch.float32))
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
+                              num_workers=num_workers, pin_memory=pin_memory)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
+                            num_workers=num_workers, pin_memory=pin_memory)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=True)
+                             num_workers=num_workers, pin_memory=pin_memory)
     return train_loader, val_loader, test_loader
 
 
@@ -838,26 +835,27 @@ def get_splits(args, seed: int) -> SplitPack:
 
 
 # -----------------------------
-# Main  # TODO
+# Main
 # -----------------------------
 def main():
     p = argparse.ArgumentParser()
 
-    p.add_argument("--dataset", type=str, default="flixster",
+    p.add_argument("--dataset", type=str, default="ml-1m",
                    choices=["ml-100k", "ml-1m", "ml-10m", "flixster", "douban"])
     p.add_argument("--data_dir", type=str, default="./data_rec")
     p.add_argument("--download", action="store_true", help="download dataset if not present")
 
     # multi-seed options
     p.add_argument("--seeds", type=int, nargs="*", default=None)
-    p.add_argument("--seed_start", type=int, default=0)
+    p.add_argument("--seed_start", type=int, default=123)
     p.add_argument("--num_seeds", type=int, default=1)
 
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--no_plot", action="store_true", default=True)
+    p.add_argument("--plot_curves", action="store_true",
+                   help="Save validation RMSE curves as a PNG (disabled by default).")
 
     # split
-    p.add_argument("--val_ratio", type=float, default=0.01)  # TODO
+    p.add_argument("--val_ratio", type=float, default=0.001)
     p.add_argument("--test_ratio", type=float, default=0.1)
 
     # rating clamp (optional override)
@@ -865,9 +863,13 @@ def main():
     p.add_argument("--rating_max", type=float, default=None)
 
     # model capacity
-    p.add_argument("--R", type=int, default=256)
-    p.add_argument("--K", type=int, default=42)
-    p.add_argument("--use_bias", action="store_true", default=True)
+    p.add_argument("--R", type=int, default=1200)
+    p.add_argument("--K", type=int, default=64)
+    p.add_argument("--use_bias", dest="use_bias", action="store_true",
+                   help="Enable user/item biases (default: enabled).")
+    p.add_argument("--no_bias", dest="use_bias", action="store_false",
+                   help="Disable user/item biases.")
+    p.set_defaults(use_bias=True)
 
     # mmf masks
     p.add_argument("--mask_mode_A", type=str, default="gaussian",
@@ -880,16 +882,20 @@ def main():
     # optimization
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="DataLoader workers (0 is safest for reproducibility).")
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--print_every", type=int, default=1)
 
     p.add_argument("--lr_baseline", type=float, default=2e-3)
-    p.add_argument("--lr_factors", type=float, default=1e-3)
-    p.add_argument("--lr_shifts", type=float, default=1e-2)
+    p.add_argument("--lr_factors", type=float, default=5e-3)
+    p.add_argument("--lr_shifts", type=float, default=5e-3)
     p.add_argument("--weight_decay", type=float, default=0.0)
 
     # shift settings
-    p.add_argument("--shift_mode", type=str, default="learned", choices=["zero", "random", "learned"])  # TODO
+    p.add_argument("--shift_mode", type=str, default="zero",
+                   choices=["zero", "random", "learned"],
+                   help="How to handle shift parameters in MMF.")
     p.add_argument("--shift_init", type=str, default="zero", choices=["zero", "random"])  # used when learned
     p.add_argument("--shift_std", type=float, default=0.1)  # used for random init
 
@@ -927,13 +933,15 @@ def main():
             pack.u_tr, pack.i_tr, pack.r_tr,
             pack.u_va, pack.i_va, pack.r_va,
             pack.u_te, pack.i_te, pack.r_te,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=str(args.device).startswith("cuda")
         )
 
         device = args.device
 
         # ---- Baseline MF ----
-        base = BasicMF(pack.num_users, pack.num_items, R=args.R, mu=mu,
+        base = BasicMF(pack.num_users, pack.num_items, R=args.R, mu=3.0,
                        use_bias=args.use_bias, device=device).to(device)
         opt_base = torch.optim.Adam(base.parameters(), lr=args.lr_baseline, weight_decay=args.weight_decay)
         print(f"\n[Baseline MF] params={count_params(base):,}")
@@ -946,7 +954,7 @@ def main():
 
         # ---- MMF ----
         mmf = MMF(
-            pack.num_users, pack.num_items, R=args.R, K=args.K, mu=mu,
+            pack.num_users, pack.num_items, R=args.R, K=args.K, mu=3.0,
             mask_mode_A=args.mask_mode_A, mask_mode_B=args.mask_mode_B,
             use_bias=args.use_bias, device=device,
             shift_mode=args.shift_mode, shift_std=args.shift_std, shift_init=args.shift_init,
@@ -1037,7 +1045,7 @@ def main():
             json.dump(summary, f, indent=2)
         print(f"[Saved] {out_json}")
 
-        if not args.no_plot:
+        if args.plot_curves:
             out_png = os.path.join(args.save_dir, f"{args.dataset}_curves_R{args.R}_K{args.K}_seed{seed}.png")
             plot_curves(out_png, res_base.history, res_mmf.history,
                         title=f"{args.dataset} | R={args.R} | K={args.K} | bias={args.use_bias} | seed={seed}")

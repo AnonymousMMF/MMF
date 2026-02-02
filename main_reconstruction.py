@@ -1,38 +1,79 @@
-# -----------------------------
-# main_reconstruction.py
-# Run examples:
-#   # 1) budget sweep only (R sweep, fixed K_ratio)
-#   python main_reconstruction.py --device cuda --I 256 --J 256 --R_list 16,32,48,64,80 --K_ratio 0.75 --out_dir out_budget
-#
-#   # 2) K sweep only (fixed R, sweep K_ratio_list)
-#   python main_reconstruction.py --device cuda --I 256 --J 256 --R 80 --K_ratio_list 0.1,0.25,0.5,0.75 --out_dir out_ksweep --x_target_fro 1.0
-#
-#   # 3) grid sweep (R_list x K_ratio_list) + auto plots
-#   python main_reconstruction.py --device cuda --I 256 --J 256 --R_list 16,32,48,64,80 --K_ratio_list 0.25,0.5,0.75 --out_dir out_grid --x_target_fro 1.0
-#
-#   # 4) block diagonal data
-#   python main_reconstruction.py --device cuda --data_mode blockdiag --num_blocks 8 --offblock_noise_scale 0.01 --R_list 32,64,96 --K_ratio 0.75 --out_dir out_block
-# -----------------------------
+"""
+main_reconstruction.py
+
+Reconstruction experiments for Masked Mixture Factorization (MMF).
+
+This script benchmarks MMF against common reconstruction baselines on a fully
+observed matrix X by minimizing mean squared error (MSE), and reports:
+- MSE
+- relative Frobenius error ||X_hat - X||_F / ||X||_F
+- wall-clock training time
+
+It supports synthetic data generation (random or block-diagonal), parameter-budget
+matched comparisons, CSV logging, and optional Matplotlib plots.
+
+Dependencies:
+  - Python 3.9+
+  - PyTorch
+  - Matplotlib (optional, only if plotting is enabled)
+
+Example commands:
+  # 1) Budget sweep (vary R, fixed K_ratio)
+  python main_reconstruction.py --device cuda --I 256 --J 256 \
+      --R_list 16,32,48,64,80 --K_ratio 0.75 --out_dir out_budget
+
+  # 2) K sweep (fixed R, vary K_ratio_list)
+  python main_reconstruction.py --device cuda --I 256 --J 256 \
+      --R 80 --K_ratio_list 0.1,0.25,0.5,0.75 --out_dir out_ksweep
+
+  # 3) Grid sweep (R_list x K_ratio_list) + plots
+  python main_reconstruction.py --device cuda --I 256 --J 256 \
+      --R_list 16,32,48,64,80 --K_ratio_list 0.25,0.5,0.75 --out_dir out_grid
+
+  # 4) Block-diagonal data
+  python main_reconstruction.py --device cuda --data_mode blockdiag --num_blocks 6 \
+      --offblock_noise_scale 0.01 --R_list 80,160,240 --K_ratio 0.4 --out_dir out_block
+"""
+
+from __future__ import annotations
 
 import argparse
-import os
 import csv
-import time
 import math
-from typing import Optional, Literal, List, Dict, Tuple
+import os
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 
-# -----------------------------
-# Utils
-# -----------------------------
-def set_seed(seed: int):
+# -----------------------------------------------------------------------------
+# Reproducibility utilities
+# -----------------------------------------------------------------------------
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    """Set seeds for PyTorch (CPU/CUDA). Optionally enable deterministic ops."""
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        # Note: enabling deterministic algorithms may raise errors for some ops,
+        # and can reduce performance
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
 
 
+def cuda_sync_if_needed(device: str) -> None:
+    """Synchronize CUDA to get accurate timing when using GPU."""
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+# -----------------------------------------------------------------------------
+# Parsing helpers
+# -----------------------------------------------------------------------------
 def parse_int_list(s: str) -> List[int]:
     s = (s or "").strip()
     if not s:
@@ -54,40 +95,42 @@ def parse_str_list(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
-def ensure_dir(d: str):
-    os.makedirs(d, exist_ok=True)
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def count_params(model: nn.Module) -> int:
+def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
 @torch.no_grad()
-def relative_fro_error(Xhat: torch.Tensor, X: torch.Tensor) -> float:
-    num = torch.linalg.norm(Xhat - X).item()
-    den = torch.linalg.norm(X).item()
-    return float(num / max(den, 1e-12))
+def relative_fro_error(X_hat: torch.Tensor, X: torch.Tensor) -> float:
+    num = torch.linalg.norm(X_hat - X)
+    den = torch.linalg.norm(X).clamp_min(1e-12)
+    return float((num / den).item())
 
 
+# -----------------------------------------------------------------------------
+# Synthetic data generation
+# -----------------------------------------------------------------------------
 def _sample_matrix(
     I: int,
     J: int,
-    dist: Literal["normal", "uniform"] = "normal",
-    scale: float = 1.0,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.float32,
+    dist: Literal["normal", "uniform"],
+    scale: float,
+    device: str,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     if dist == "normal":
         return scale * torch.randn(I, J, device=device, dtype=dtype)
-    elif dist == "uniform":
+    if dist == "uniform":
         return scale * (2.0 * torch.rand(I, J, device=device, dtype=dtype) - 1.0)
-    else:
-        raise ValueError(f"Unknown dist: {dist}")
+    raise ValueError(f"Unknown dist: {dist}")
 
 
 def _normalize_fro(X: torch.Tensor) -> torch.Tensor:
-    fro = torch.linalg.norm(X)
-    return X / fro.clamp_min(1e-12)
+    fro = torch.linalg.norm(X).clamp_min(1e-12)
+    return X / fro
 
 
 def make_random_X(
@@ -100,7 +143,7 @@ def make_random_X(
     device: str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    set_seed(seed)
+    set_global_seed(seed)
     X = _sample_matrix(I, J, dist=dist, scale=scale, device=device, dtype=dtype)
     if normalize == "fro":
         X = _normalize_fro(X)
@@ -131,7 +174,10 @@ def make_block_diag_X(
     device: str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    set_seed(seed)
+    """
+    Construct a (roughly) block-diagonal matrix. Off-block entries are small noise.
+    """
+    set_global_seed(seed)
     X = _sample_matrix(I, J, dist=dist, scale=offblock_noise_scale, device=device, dtype=dtype)
 
     row_sizes = _split_sizes(I, num_blocks)
@@ -141,7 +187,9 @@ def make_block_diag_X(
     for b in range(num_blocks):
         r1 = r0 + row_sizes[b]
         c1 = c0 + col_sizes[b]
-        block = _sample_matrix(row_sizes[b], col_sizes[b], dist=dist, scale=block_scale, device=device, dtype=dtype)
+        block = _sample_matrix(
+            row_sizes[b], col_sizes[b], dist=dist, scale=block_scale, device=device, dtype=dtype
+        )
         X[r0:r1, c0:c1] = block
         r0, c0 = r1, c1
 
@@ -154,45 +202,47 @@ def make_block_diag_X(
     return X
 
 
-# -----------------------------
-# Truncated SVD
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Baseline: truncated SVD reconstruction
+# -----------------------------------------------------------------------------
 @torch.no_grad()
 def truncated_svd_reconstruct(X: torch.Tensor, r: int) -> torch.Tensor:
+    """
+    Best rank-r approximation under Frobenius norm (Eckart–Young theorem).
+    """
     r = int(max(1, min(r, min(X.shape))))
     U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    Ur = U[:, :r]
-    Sr = S[:r]
-    Vhr = Vh[:r, :]
-    return (Ur * Sr) @ Vhr
+    return (U[:, :r] * S[:r]) @ Vh[:r, :]
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Models
-# -----------------------------
+# -----------------------------------------------------------------------------
 class BasicMF(nn.Module):
-    """X ≈ A B^T"""
+    """Matrix factorization: X ≈ A B^T"""
+
     def __init__(self, I: int, J: int, R: int, init_scale: float = 0.02, device: str = "cpu"):
         super().__init__()
         self.A = nn.Parameter(init_scale * torch.randn(I, R, device=device))
         self.B = nn.Parameter(init_scale * torch.randn(J, R, device=device))
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         return self.A @ self.B.T
 
     @torch.no_grad()
-    def snapshot(self):
+    def snapshot(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return (self.A.detach().clone(), self.B.detach().clone())
 
     @torch.no_grad()
-    def load_snapshot(self, snap):
+    def load_snapshot(self, snap: Tuple[torch.Tensor, torch.Tensor]) -> None:
         A, B = snap
         self.A.copy_(A)
         self.B.copy_(B)
 
 
 class BiasMF(nn.Module):
-    """X ≈ A B^T + a 1^T + 1 b^T + mu"""
+    """Biased MF: X ≈ A B^T + a 1^T + 1 b^T + mu"""
+
     def __init__(self, I: int, J: int, R: int, init_scale: float = 0.02, device: str = "cpu"):
         super().__init__()
         self.A = nn.Parameter(init_scale * torch.randn(I, R, device=device))
@@ -201,11 +251,11 @@ class BiasMF(nn.Module):
         self.b = nn.Parameter(torch.zeros(J, device=device))
         self.mu = nn.Parameter(torch.zeros((), device=device))
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         return self.A @ self.B.T + self.a[:, None] + self.b[None, :] + self.mu
 
     @torch.no_grad()
-    def snapshot(self):
+    def snapshot(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             self.A.detach().clone(),
             self.B.detach().clone(),
@@ -215,7 +265,7 @@ class BiasMF(nn.Module):
         )
 
     @torch.no_grad()
-    def load_snapshot(self, snap):
+    def load_snapshot(self, snap) -> None:
         A, B, a, b, mu = snap
         self.A.copy_(A)
         self.B.copy_(B)
@@ -226,43 +276,49 @@ class BiasMF(nn.Module):
 
 class NMFModel(nn.Module):
     """
-    Nonnegative MF: X ≈ A B^T with A,B >= 0 via softplus.
+    Nonnegative MF via softplus reparameterization:
+      X ≈ A B^T with A,B >= 0.
     """
+
     def __init__(self, I: int, J: int, R: int, init_scale: float = 0.02, device: str = "cpu"):
         super().__init__()
         self.A_raw = nn.Parameter(init_scale * torch.randn(I, R, device=device))
         self.B_raw = nn.Parameter(init_scale * torch.randn(J, R, device=device))
         self.softplus = nn.Softplus(beta=1.0)
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         A = self.softplus(self.A_raw)
         B = self.softplus(self.B_raw)
         return A @ B.T
 
     @torch.no_grad()
-    def snapshot(self):
+    def snapshot(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return (self.A_raw.detach().clone(), self.B_raw.detach().clone())
 
     @torch.no_grad()
-    def load_snapshot(self, snap):
+    def load_snapshot(self, snap: Tuple[torch.Tensor, torch.Tensor]) -> None:
         A_raw, B_raw = snap
         self.A_raw.copy_(A_raw)
         self.B_raw.copy_(B_raw)
 
-# TODO
-def _make_mask_fn(mode: str):
+
+def make_mask_fn(mode: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Return a pointwise mask function g(d). Different choices produce different
+    gating profiles; some are bounded in [0,1], others are not.
+    """
     if mode == "sin":
-        return lambda d: torch.sin(d)
+        return torch.sin
     if mode == "cos":
-        return lambda d: torch.cos(d)
+        return torch.cos
     if mode == "gaussian":
-        return lambda d: torch.exp(-d ** 2 / 2)
+        return lambda d: 4 * torch.exp(-d ** 2 / 2.0)
     if mode == "sigmoid":
-        return lambda d: torch.sigmoid(d)
+        return torch.sigmoid
     if mode == "tanh":
-        return lambda d: torch.tanh(d)
+        return torch.tanh
     if mode == "triangle":
-        return lambda d: torch.clamp(1.0 - torch.abs(d), min=0.0)
+        return lambda d: 4 * torch.clamp(1.0 - torch.abs(d), min=0.0)
     if mode == "linear":
         return lambda d: d
     if mode == "sinc":
@@ -278,20 +334,36 @@ def _make_mask_fn(mode: str):
     if mode == "linear01":
         return lambda d: (d + 0.5).clamp(0.0, 1.0)
     if mode == "psin":
-        return lambda d: (torch.sin(math.pi * d) + 2.5) / 5
+        return lambda d: (torch.sin(math.pi * d) + 2.5) / 5.0
     if mode == "pcos":
-        return lambda d: (torch.cos(math.pi * d) + 2.5) / 5
+        return lambda d: (torch.cos(math.pi * d) + 2.5) / 5.0
     if mode == "tri":
-        return lambda d: 1.0 - 2.0 * torch.abs(torch.remainder(d + 1, 2) - 1)
-    raise ValueError(f"Unknown mask mode: {mode}")
+        return lambda d: 1.0 - 2.0 * torch.abs(torch.remainder(d + 1.0, 2.0) - 1.0)
+    raise ValueError(
+        f"Unknown mask mode: {mode}. "
+        "Try one of: sin, cos, gaussian, sigmoid, tanh, triangle, linear, sinc, "
+        "square, cauchy, sin01, cos01, linear01, psin, pcos, tri."
+    )
 
 
 class MMF(nn.Module):
+    """
+    Masked Mixture Factorization (MMF).
+
+    We maintain base factors A,B of size R_base and learn K shift parameters per row/column
+    to generate K masks. The effective concatenated latent size is K*R_base.
+
+    For budget matching with a vanilla MF of rank R:
+      choose R_base = R - K
+    because MMF parameters scale as:
+      (I+J)*R_base  +  (I+J)*K  ≈  (I+J)*R
+    """
+
     def __init__(
         self,
         I: int,
         J: int,
-        R: int,
+        R_base: int,
         K: int,
         init_scale: float = 0.02,
         device: str = "cpu",
@@ -300,42 +372,61 @@ class MMF(nn.Module):
         mask_scale: Optional[float] = None,
     ):
         super().__init__()
-        self.I, self.J, self.R, self.K = I, J, R, K
-        self.half = self.R / 2
-        self.mask_scale = (1.0 / K) if (mask_scale is None) else float(mask_scale)
-        self.mask_scale_square = self.mask_scale ** 2
+        if K < 1:
+            raise ValueError("K must be >= 1")
+        if R_base < 1:
+            raise ValueError("R_base must be >= 1")
 
-        self.A = nn.Parameter(init_scale * torch.randn(I, R, device=device).unsqueeze(1))  # (I,1,R)
-        self.B = nn.Parameter(init_scale * torch.randn(J, R, device=device).unsqueeze(1))  # (J,1,R)
+        self.I, self.J, self.R_base, self.K = int(I), int(J), int(R_base), int(K)
 
-        self.uA = nn.Parameter(torch.zeros(I, K, device=device).unsqueeze(-1))  # (I,K,1)
-        self.uB = nn.Parameter(torch.zeros(J, K, device=device).unsqueeze(-1))  # (J,K,1)
+        # Empirically, scaling by 1/K stabilizes the magnitude of the summed mixtures
+        self.mask_scale = float(1.0 / K) if (mask_scale is None) else float(mask_scale)
 
-        self.pos = torch.arange(R, device=device).view(1, 1, R)
-        self.omega = torch.linspace(1 / K, 1, steps=K, device=device).view(1, K, 1)
-        self.template = self.pos * self.omega  # (1,K,R)
+        # Parameters:
+        #   A:  (I, 1, R_base), B: (J, 1, R_base)
+        #   uA: (I, K, 1),     uB: (J, K, 1)    (learned shifts)
+        self.A = nn.Parameter(init_scale * torch.randn(I, R_base, device=device).unsqueeze(1))
+        self.B = nn.Parameter(init_scale * torch.randn(J, R_base, device=device).unsqueeze(1))
+        self.uA = nn.Parameter(torch.zeros(I, K, device=device).unsqueeze(-1))
+        self.uB = nn.Parameter(torch.zeros(J, K, device=device).unsqueeze(-1))
 
-        self._mask_fn_A = _make_mask_fn(mask_mode_A)
-        self._mask_fn_B = _make_mask_fn(mask_mode_B)
+        # Register constant buffers so they move correctly with .to(device)
+        pos = torch.arange(R_base, device=device).view(1, 1, R_base)                # (1,1,R_base)
+        omega = torch.linspace(1.0 / K, 1.0, steps=K, device=device).view(1, K, 1)  # (1,K,1)
+        template = pos * omega                                                      # (1,K,R_base)
+        self.register_buffer("pos", pos, persistent=False)
+        self.register_buffer("omega", omega, persistent=False)
+        self.register_buffer("template", template, persistent=False)
 
-    def forward(self):
-        deltaA = self.template - self.half * self.uA  # (I,K,R)
-        deltaB = self.template - self.half * self.uB  # (J,K,R)
+        self._half = float(R_base) / 2.0
+        self._mask_fn_A = make_mask_fn(mask_mode_A)
+        self._mask_fn_B = make_mask_fn(mask_mode_B)
+
+    def forward(self) -> torch.Tensor:
+        deltaA = self.template - self._half * self.uA
+        deltaB = self.template - self._half * self.uB
 
         mA = self._mask_fn_A(deltaA)
         mB = self._mask_fn_B(deltaB)
 
-        A_cat = (self.A * mA).reshape(self.I, self.K * self.R)  # (I,KR)
-        B_cat = (self.B * mB).reshape(self.J, self.K * self.R)  # (J,KR)
+        # Concatenate K masked copies along the latent dimension
+        A_cat = (self.A * mA).reshape(self.I, self.K * self.R_base)
+        B_cat = (self.B * mB).reshape(self.J, self.K * self.R_base)
 
-        return self.mask_scale_square * (A_cat @ B_cat.T)
-
-    @torch.no_grad()
-    def snapshot(self):
-        return (self.A.detach().clone(), self.B.detach().clone(), self.uA.detach().clone(), self.uB.detach().clone())
+        # Equivalent to (mask_scale * A_cat) @ (mask_scale * B_cat)^T
+        return (self.mask_scale**2) * (A_cat @ B_cat.T)
 
     @torch.no_grad()
-    def load_snapshot(self, snap):
+    def snapshot(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.A.detach().clone(),
+            self.B.detach().clone(),
+            self.uA.detach().clone(),
+            self.uB.detach().clone(),
+        )
+
+    @torch.no_grad()
+    def load_snapshot(self, snap) -> None:
         A, B, uA, uB = snap
         self.A.copy_(A)
         self.B.copy_(B)
@@ -343,113 +434,212 @@ class MMF(nn.Module):
         self.uB.copy_(uB)
 
 
-# -----------------------------
-# Training loop (shared)
-# -----------------------------
-def _train_loop(
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TrainResult:
+    best_epoch: int
+    train_time_sec: float
+    mse: float
+    rel_fro: float
+
+
+def train_full_matrix(
     model: nn.Module,
     X: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     epochs: int,
-    print_every: int,
+    log_every: int,
     seed: int,
+    device: str,
     ridge_lambda: float = 0.0,
-    ridge_params: Optional[List[torch.Tensor]] = None,
+    ridge_params: Optional[Sequence[torch.Tensor]] = None,
     tag: str = "",
-) -> Tuple[nn.Module, float, float, int, float]:
-    set_seed(seed)
-    I, J = X.shape
-    n_elem = float(I * J)
+) -> TrainResult:
+    """
+    Train a model to reconstruct a fully observed matrix X by minimizing MSE.
+    Optionally adds ridge regularization on specified parameters.
+    """
+    set_global_seed(seed)
+    n_elem = float(X.numel())
     x_fro = float(torch.linalg.norm(X).detach().item())
 
     best_val = float("inf")
     best_epoch = -1
     best_snap = None
 
-    t0 = time.time()
-    total_start = time.time()
-    for epoch in range(epochs):
+    cuda_sync_if_needed(device)
+    t_start = time.time()
+    t_last = t_start
+
+    for epoch in range(int(epochs)):
         X_hat = model()
         diff = X_hat - X
         mse = (diff * diff).mean()
 
         loss = mse
         if ridge_lambda > 0.0 and ridge_params:
-            ridge = 0.0
+            ridge = torch.zeros((), device=X.device, dtype=X.dtype)
             for p in ridge_params:
                 ridge = ridge + (p * p).sum()
-            loss = loss + ridge_lambda * ridge / max(n_elem, 1.0)
+            loss = loss + float(ridge_lambda) * ridge / max(n_elem, 1.0)
 
         val = float(loss.detach().item())
         if val < best_val:
             best_val = val
             best_epoch = epoch
-            best_snap = model.snapshot() if hasattr(model, "snapshot") else None
+            if hasattr(model, "snapshot"):
+                best_snap = model.snapshot()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        if (epoch % print_every == 0) or (epoch == epochs - 1):
-            rel_fro = math.sqrt(float(mse.detach().item()) * n_elem) / max(x_fro, 1e-12)
-            best_rel_fro = math.sqrt(best_val * n_elem) / max(x_fro, 1e-12)
+        if log_every > 0 and ((epoch % log_every == 0) or (epoch == epochs - 1)):
+            rel_fro_approx = math.sqrt(float(mse.detach().item()) * n_elem) / max(x_fro, 1e-12)
+            best_rel_fro_approx = math.sqrt(best_val * n_elem) / max(x_fro, 1e-12)
+            dt = time.time() - t_last
             print(
-                f"[{tag:10s} {epoch:5d}/{epochs}] "
-                f"loss={loss.item():.6e}  rel_fro~={rel_fro:.6f}  "
-                f"(best~={best_rel_fro:.6f}@{best_epoch})  time={time.time() - t0:.3f}s"
+                f"[{tag:12s} {epoch:5d}/{epochs}] "
+                f"loss={loss.item():.6e}  rel_fro~={rel_fro_approx:.6f}  "
+                f"(best~={best_rel_fro_approx:.6f}@{best_epoch})  step_time={dt:.3f}s"
             )
-            t0 = time.time()
+            t_last = time.time()
 
-    elapsed = time.time() - total_start
+    cuda_sync_if_needed(device)
+    train_time = time.time() - t_start
 
     if best_snap is not None and hasattr(model, "load_snapshot"):
         model.load_snapshot(best_snap)
 
     with torch.no_grad():
         X_hat = model()
-        final_mse = float(torch.mean((X_hat - X) ** 2).item())
-        final_rel = relative_fro_error(X_hat, X)
+        mse_final = float(torch.mean((X_hat - X) ** 2).item())
+        rel_final = relative_fro_error(X_hat, X)
 
-    return model, final_mse, final_rel, best_epoch, elapsed
+    return TrainResult(best_epoch=best_epoch, train_time_sec=train_time, mse=mse_final, rel_fro=rel_final)
 
 
-def train_mf_sgd(X, I, J, R, device, epochs, lr, print_every, seed, momentum=0.9):
+# -----------------------------------------------------------------------------
+# Method wrappers
+# -----------------------------------------------------------------------------
+def train_mf_sgd(
+    X: torch.Tensor,
+    I: int,
+    J: int,
+    R: int,
+    device: str,
+    epochs: int,
+    lr: float,
+    log_every: int,
+    seed: int,
+    momentum: float = 0.9,
+) -> Tuple[nn.Module, TrainResult]:
     model = BasicMF(I, J, R, device=device).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
-    return _train_loop(model, X, opt, epochs, print_every, seed, tag="MF-SGD")
+    res = train_full_matrix(model, X, opt, epochs, log_every, seed, device=device, tag="MF-SGD")
+    return model, res
 
 
-def train_mf_ridge(X, I, J, R, device, epochs, lr, print_every, seed, ridge_lambda=1e-3):
+def train_mf_ridge(
+    X: torch.Tensor,
+    I: int,
+    J: int,
+    R: int,
+    device: str,
+    epochs: int,
+    lr: float,
+    log_every: int,
+    seed: int,
+    ridge_lambda: float = 1e-3,
+) -> Tuple[nn.Module, TrainResult]:
     model = BasicMF(I, J, R, device=device).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    return _train_loop(model, X, opt, epochs, print_every, seed,
-                       ridge_lambda=ridge_lambda, ridge_params=[model.A, model.B], tag="MF-Ridge")
+    res = train_full_matrix(
+        model,
+        X,
+        opt,
+        epochs,
+        log_every,
+        seed,
+        device=device,
+        ridge_lambda=ridge_lambda,
+        ridge_params=[model.A, model.B],
+        tag="MF-Ridge",
+    )
+    return model, res
 
 
-def train_mf_bias(X, I, J, R, device, epochs, lr, print_every, seed, bias_ridge_lambda=0.0):
+def train_mf_bias(
+    X: torch.Tensor,
+    I: int,
+    J: int,
+    R: int,
+    device: str,
+    epochs: int,
+    lr: float,
+    log_every: int,
+    seed: int,
+    bias_ridge_lambda: float = 0.0,
+) -> Tuple[nn.Module, TrainResult]:
     model = BiasMF(I, J, R, device=device).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ridge_params = [model.A, model.B, model.a, model.b]
-    return _train_loop(model, X, opt, epochs, print_every, seed,
-                       ridge_lambda=bias_ridge_lambda, ridge_params=ridge_params, tag="MF+Bias")
+    res = train_full_matrix(
+        model,
+        X,
+        opt,
+        epochs,
+        log_every,
+        seed,
+        device=device,
+        ridge_lambda=bias_ridge_lambda,
+        ridge_params=ridge_params,
+        tag="MF+Bias",
+    )
+    return model, res
 
 
-def train_nmf(X, I, J, R, device, epochs, lr, print_every, seed):
+def train_nmf(
+    X: torch.Tensor,
+    I: int,
+    J: int,
+    R: int,
+    device: str,
+    epochs: int,
+    lr: float,
+    log_every: int,
+    seed: int,
+) -> Tuple[nn.Module, TrainResult]:
     model = NMFModel(I, J, R, device=device).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    return _train_loop(model, X, opt, epochs, print_every, seed, tag="NMF")
+    res = train_full_matrix(model, X, opt, epochs, log_every, seed, device=device, tag="NMF")
+    return model, res
 
 
 def train_mmf(
-    X, I, J, R_base, K, device, epochs,
-    lr_factors, lr_shifts,
-    print_every, seed,
-    mask_mode_A="cos",
-    mask_mode_B="cos",
-    mask_scale: Optional[float] = None,
-):
+    X: torch.Tensor,
+    I: int,
+    J: int,
+    R_base: int,
+    K: int,
+    device: str,
+    epochs: int,
+    lr_factors: float,
+    lr_shifts: float,
+    log_every: int,
+    seed: int,
+    mask_mode_A: str,
+    mask_mode_B: str,
+    mask_scale: Optional[float],
+) -> Tuple[nn.Module, TrainResult]:
     model = MMF(
-        I, J, R_base, K=K, device=device,
+        I=I,
+        J=J,
+        R_base=R_base,
+        K=K,
+        device=device,
         mask_mode_A=mask_mode_A,
         mask_mode_B=mask_mode_B,
         mask_scale=mask_scale,
@@ -461,95 +651,110 @@ def train_mmf(
             {"params": [model.uA, model.uB], "lr": lr_shifts},
         ]
     )
-    return _train_loop(model, X, opt, epochs, print_every, seed, tag=f"MMF(K={K})")
+    res = train_full_matrix(model, X, opt, epochs, log_every, seed, device=device, tag=f"MMF(K={K})")
+    return model, res
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Budget mapping
-# -----------------------------
+# -----------------------------------------------------------------------------
 def budget_from_R(I: int, J: int, R: int) -> int:
+    """Parameter budget proxy for vanilla MF: (I+J)*R."""
     return int((I + J) * R)
 
 
-def rank_for_bias_mf(I: int, J: int, B: int, rank_bonus: int = 0) -> int:
+def rank_for_bias_mf(I: int, J: int, budget: int, rank_bonus: int = 0) -> int:
     """
-    nominal: r = floor((B - (I+J+1)) / (I+J))
-    then + rank_bonus
+    Compute the MF rank that approximately matches the parameter budget of vanilla MF
+    when adding bias terms (a, b, mu).
     """
     extra = I + J + 1
     denom = I + J
-    r = (B - extra) // denom
-    r = int(max(1, r + int(rank_bonus)))
-    return r
+    r = (budget - extra) // denom
+    return int(max(1, r + int(rank_bonus)))
 
 
-# -----------------------------
-# Single run (one setting)
-# -----------------------------
+# -----------------------------------------------------------------------------
+# One experiment setting
+# -----------------------------------------------------------------------------
 def run_one_setting(
     X_orig: torch.Tensor,
     I: int,
     J: int,
     R: int,
     K: int,
-    args,
-    methods: List[str],
+    args: argparse.Namespace,
+    methods: Sequence[str],
     seed: int,
 ) -> List[Dict[str, object]]:
     """
-    Returns rows for CSV.
+    Run all selected methods under a single (R, K, seed) configuration.
+
+    Notes on scaling:
+      For some mask families and large K, the magnitude of X can affect optimization.
+      We optionally rescale X to have a target Frobenius norm in the scaled space.
+      Results are always reported back on the original scale.
     """
     device = args.device
-    B = budget_from_R(I, J, R)
+    budget = budget_from_R(I, J, R)
 
-    # scaling trick
-    if args.x_target_fro < 0:
-        target_fro = float(K)
-    else:
-        target_fro = float(args.x_target_fro)
+    target_fro = float(K) if args.x_target_fro < 0 else float(args.x_target_fro)
 
-    X = X_orig.clone()
+    X = X_orig
     x_fro = float(torch.linalg.norm(X).detach().item())
-    sX = target_fro / max(x_fro, 1e-12)
-    Xs = X * sX
+    scale_X = target_fro / max(x_fro, 1e-12)
+    X_scaled = X * scale_X
 
-    print("\n============================================================")
-    print(f"[Setting] seed={seed} I={I} J={J}  R={R}  K={K}  Budget~={B:,}")
-    print(f"X scaling: target_fro={target_fro:.3f}, scale sX={sX:.6f}")
-    print("============================================================")
+    print("\n" + "=" * 72)
+    print(f"[Setting] seed={seed}  I={I}  J={J}  R={R}  K={K}  budget~={(budget):,}")
+    print(f"Scaling: target_fro={target_fro:.3f}  scale_X={scale_X:.6f}")
+    print("=" * 72)
 
     rows: List[Dict[str, object]] = []
 
-    def add_row(method: str, params: int, best_epoch: int, train_time: float, Xhat_scaled: torch.Tensor):
-        Xhat = Xhat_scaled / sX  # back to original scale
+    def add_row(method: str, params: int, result: TrainResult, Xhat_scaled: torch.Tensor) -> None:
+        Xhat = Xhat_scaled / scale_X  # back to original scale
         mse = float(torch.mean((Xhat - X) ** 2).item())
         rel = relative_fro_error(Xhat, X)
-        rows.append({
-            "seed": seed,
-            "I": I, "J": J,
-            "R": R, "K": K,
-            "K_ratio": (K / R),
-            "budget": B,
-            "method": method,
-            "params": int(params),
-            "best_epoch": int(best_epoch),
-            "train_time_sec": float(train_time),
-            "mse": mse,
-            "rel_fro": rel,
-        })
+        rows.append(
+            {
+                "seed": int(seed),
+                "I": int(I),
+                "J": int(J),
+                "R": int(R),
+                "K": int(K),
+                "K_ratio": float(K / R),
+                "budget": int(budget),
+                "method": str(method),
+                "params": int(params),
+                "best_epoch": int(result.best_epoch),
+                "train_time_sec": float(result.train_time_sec),
+                "mse": float(mse),
+                "rel_fro": float(rel),
+            }
+        )
 
-    # ---- MMF ----
+    # -------------------------------------------------------------------------
+    # MMF (budget matched by choosing R_base = R - K)
+    # -------------------------------------------------------------------------
     if "mmf" in methods:
         R_base = R - K
-        assert R_base >= 1, f"Invalid: R-K must be >= 1 (R={R}, K={K})"
+        if R_base < 1:
+            raise ValueError(f"Invalid configuration: R - K must be >= 1 (R={R}, K={K}).")
+
         mask_scale = None if (args.mask_scale < 0) else float(args.mask_scale)
 
-        model, _, _, best_ep, tsec = train_mmf(
-            X=Xs, I=I, J=J, R_base=R_base, K=K, device=device,
-            epochs=args.epochs,  # TODO
+        model, res = train_mmf(
+            X=X_scaled,
+            I=I,
+            J=J,
+            R_base=R_base,
+            K=K,
+            device=device,
+            epochs=args.epochs,
             lr_factors=args.lr_factors,
             lr_shifts=args.lr_shifts,
-            print_every=args.print_every,
+            log_every=args.log_every,
             seed=seed,
             mask_mode_A=args.mask_mode_A,
             mask_mode_B=args.mask_mode_B,
@@ -557,114 +762,137 @@ def run_one_setting(
         )
         with torch.no_grad():
             Xhat_s = model()
-        add_row("MMF", count_params(model), best_ep, tsec, Xhat_s)
+        add_row("MMF", count_parameters(model), res, Xhat_s)
 
-    # ---- SVD ----
+    # -------------------------------------------------------------------------
+    # Truncated SVD
+    # -------------------------------------------------------------------------
     if "svd" in methods:
+        cuda_sync_if_needed(device)
         t0 = time.time()
-        Xhat_s = truncated_svd_reconstruct(Xs, R)
+        Xhat_s = truncated_svd_reconstruct(X_scaled, R)
+        cuda_sync_if_needed(device)
         tsec = time.time() - t0
-        params = (I + J) * R  # ignore +R singular values
-        print(f"[SVD rank={R}] rel_fro_scaled={relative_fro_error(Xhat_s, Xs):.6f} time={tsec:.3f}s")
-        add_row("SVD", params, 0, tsec, Xhat_s)
 
-    # ---- MF-SGD ----
+        # Proxy parameter count for consistency in tables (ignoring singular values)
+        params = (I + J) * R
+        print(f"[SVD rank={R}] rel_fro_scaled={relative_fro_error(Xhat_s, X_scaled):.6f}  time={tsec:.3f}s")
+        add_row("SVD", params, TrainResult(best_epoch=0, train_time_sec=tsec, mse=0.0, rel_fro=0.0), Xhat_s)
+
+    # -------------------------------------------------------------------------
+    # MF baselines
+    # -------------------------------------------------------------------------
     if "mf_sgd" in methods:
-        model, _, _, best_ep, tsec = train_mf_sgd(
-            X=Xs, I=I, J=J, R=R, device=device,
-            epochs=args.epochs,  # TODO
+        model, res = train_mf_sgd(
+            X=X_scaled,
+            I=I,
+            J=J,
+            R=R,
+            device=device,
+            epochs=args.epochs,
             lr=args.lr_mf_sgd,
-            print_every=args.print_every,
+            log_every=args.log_every,
             seed=seed,
             momentum=args.mf_sgd_momentum,
         )
         with torch.no_grad():
             Xhat_s = model()
-        add_row("MF_SGD", count_params(model), best_ep, tsec, Xhat_s)
+        add_row("MF_SGD", count_parameters(model), res, Xhat_s)
 
-    # ---- MF-Ridge ----
     if "mf_ridge" in methods:
-        model, _, _, best_ep, tsec = train_mf_ridge(
-            X=Xs, I=I, J=J, R=R, device=device,
+        model, res = train_mf_ridge(
+            X=X_scaled,
+            I=I,
+            J=J,
+            R=R,
+            device=device,
             epochs=args.epochs,
             lr=args.lr_mf_ridge,
-            print_every=args.print_every,
+            log_every=args.log_every,
             seed=seed,
             ridge_lambda=args.ridge_lambda,
         )
         with torch.no_grad():
             Xhat_s = model()
-        add_row("MF_Ridge", count_params(model), best_ep, tsec, Xhat_s)
+        add_row("MF_Ridge", count_parameters(model), res, Xhat_s)
 
-    # ---- MF+Bias (budget matched, +bonus if desired) ----
     if "mf_bias" in methods:
-        r_bias = rank_for_bias_mf(I, J, B, rank_bonus=args.bias_rank_bonus)
-        print(f"[MF+Bias] budget match: R_base={R} => R_bias={r_bias} (bonus={args.bias_rank_bonus})")
-        model, _, _, best_ep, tsec = train_mf_bias(
-            X=Xs, I=I, J=J, R=r_bias, device=device,
+        r_bias = rank_for_bias_mf(I, J, budget, rank_bonus=args.bias_rank_bonus)
+        print(f"[MF+Bias] budget match: R_base={R} -> R_bias={r_bias} (bonus={args.bias_rank_bonus})")
+        model, res = train_mf_bias(
+            X=X_scaled,
+            I=I,
+            J=J,
+            R=r_bias,
+            device=device,
             epochs=args.epochs,
             lr=args.lr_mf_bias,
-            print_every=args.print_every,
+            log_every=args.log_every,
             seed=seed,
             bias_ridge_lambda=args.bias_ridge_lambda,
         )
         with torch.no_grad():
             Xhat_s = model()
-        add_row("MF_Bias", count_params(model), best_ep, tsec, Xhat_s)
+        add_row("MF_Bias", count_parameters(model), res, Xhat_s)
 
-    # ---- NMF ----
+    # -------------------------------------------------------------------------
+    # NMF (only meaningful when X is nonnegative)
+    # -------------------------------------------------------------------------
     if "nmf" in methods:
-        if float(Xs.min().item()) < -1e-12:
-            print("[NMF] Skipped: X has negative entries. Use --data_nonneg for fair NMF.")
+        if float(X_scaled.min().item()) < -1e-12:
+            print("[NMF] Skipped: X has negative entries. Use --data_nonneg for a fair NMF run.")
         else:
-            model, _, _, best_ep, tsec = train_nmf(
-                X=Xs, I=I, J=J, R=R, device=device,
+            model, res = train_nmf(
+                X=X_scaled,
+                I=I,
+                J=J,
+                R=R,
+                device=device,
                 epochs=args.epochs,
                 lr=args.lr_nmf,
-                print_every=args.print_every,
+                log_every=args.log_every,
                 seed=seed,
             )
             with torch.no_grad():
                 Xhat_s = model()
-            add_row("NMF", count_params(model), best_ep, tsec, Xhat_s)
+            add_row("NMF", count_parameters(model), res, Xhat_s)
 
     return rows
 
 
-# -----------------------------
-# Save CSV
-# -----------------------------
-def save_csv(rows: List[Dict[str, object]], path: str):
+# -----------------------------------------------------------------------------
+# Output utilities
+# -----------------------------------------------------------------------------
+def save_csv(rows: List[Dict[str, object]], path: str) -> None:
     if not rows:
         return
     keys = list(rows[0].keys())
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
-        for r in rows:
-            w.writerow(r)
+        w.writerows(rows)
 
 
-# -----------------------------
-# Plotting (matplotlib)
-# -----------------------------
-def make_plots(rows: List[Dict[str, object]], out_dir: str):
+# -----------------------------------------------------------------------------
+# Plotting (optional)
+# -----------------------------------------------------------------------------
+def make_plots(rows: List[Dict[str, object]], out_dir: str, backend: str = "Agg") -> None:
     """
     Creates:
       (1) rel_fro vs budget for each fixed K_ratio (mean over seeds)
       (2) rel_fro vs K_ratio for each fixed R (MMF curve + baseline horizontal lines)
     """
-    import matplotlib
-    matplotlib.use('TkAgg')  # 또는 'Qt5Agg', 'WXAgg' 등 사용 가능한 대화형 백엔드로 변경
-    import matplotlib.pyplot as plt
-    from collections import defaultdict
-
     if not rows:
         return
 
-    # ---------- marker styles (unfilled) ----------
-    # Feel free to tweak marker choices; these are distinct & common.
-    MARKERS = {
+    import matplotlib
+
+    # Use a non-interactive backend by default so plotting works on servers/CI
+    matplotlib.use(backend)
+    import matplotlib.pyplot as plt
+    from collections import defaultdict
+
+    marker_map = {
         "MMF": "o",
         "SVD": "s",
         "MF_SGD": "^",
@@ -672,48 +900,46 @@ def make_plots(rows: List[Dict[str, object]], out_dir: str):
         "MF_Bias": "v",
         "NMF": "P",
     }
-    FALLBACK_MARKERS = ["X", "*", "<", ">", "h", "H", "8", "p", "+", "x", "1", "2", "3", "4"]
+    fallback_markers = ["X", "*", "<", ">", "h", "H", "8", "p", "+", "x", "1", "2", "3", "4"]
 
     def label_of(method: str) -> str:
-        # Show MMF as proposed in legend
         return "MMF (proposed)" if method == "MMF" else method
 
-    def order_methods(method_list: List[str]) -> List[str]:
-        # MMF first, then the rest alphabetical
+    def order_methods(method_list: Sequence[str]) -> List[str]:
         rest = sorted([m for m in method_list if m != "MMF"])
         return (["MMF"] if "MMF" in method_list else []) + rest
 
     def marker_of(method: str, idx_fallback: int) -> str:
-        if method in MARKERS:
-            return MARKERS[method]
-        return FALLBACK_MARKERS[idx_fallback % len(FALLBACK_MARKERS)]
+        return marker_map.get(method, fallback_markers[idx_fallback % len(fallback_markers)])
 
-    # ---------- aggregate mean over seeds for each (R, K, method) ----------
-    acc = defaultdict(list)
-    meta = {}
+    # Aggregate mean over seeds for each (R, K, method)
+    acc: Dict[Tuple[int, int, str], List[float]] = defaultdict(list)
+    meta: Dict[Tuple[int, int, str], Dict[str, object]] = {}
     for r in rows:
         key = (int(r["R"]), int(r["K"]), str(r["method"]))
         acc[key].append(float(r["rel_fro"]))
         meta[key] = r
 
-    agg = []
+    agg: List[Dict[str, object]] = []
     for (R, K, method), vals in acc.items():
-        m = sum(vals) / len(vals)
-        agg.append({
-            "R": R, "K": K, "K_ratio": K / R,
-            "budget": int(meta[(R, K, method)]["budget"]),
-            "method": method,
-            "rel_fro_mean": m,
-            "nseed": len(vals),
-        })
+        agg.append(
+            {
+                "R": R,
+                "K": K,
+                "K_ratio": K / R,
+                "budget": int(meta[(R, K, method)]["budget"]),
+                "method": method,
+                "rel_fro_mean": sum(vals) / len(vals),
+                "nseed": len(vals),
+            }
+        )
 
-    methods = order_methods(sorted(list({a["method"] for a in agg})))
+    methods = order_methods(sorted({a["method"] for a in agg}))
 
-    # ---------- (1) rel_fro vs budget for each fixed K_ratio ----------
-    grp_kr = defaultdict(list)
+    # (1) rel_fro vs budget for each fixed K_ratio
+    grp_kr: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for a in agg:
-        kr_key = f"{a['K_ratio']:.4f}"
-        grp_kr[kr_key].append(a)
+        grp_kr[f"{float(a['K_ratio']):.4f}"].append(a)
 
     for kr_key, items in sorted(grp_kr.items(), key=lambda kv: float(kv[0])):
         plt.figure()
@@ -723,70 +949,66 @@ def make_plots(rows: List[Dict[str, object]], out_dir: str):
             pts = [x for x in items if x["method"] == method]
             if not pts:
                 continue
-            pts = sorted(pts, key=lambda d: d["budget"])
-            xs = [p["budget"] for p in pts]
-            ys = [p["rel_fro_mean"] for p in pts]
+            pts = sorted(pts, key=lambda d: int(d["budget"]))
+            xs = [int(p["budget"]) for p in pts]
+            ys = [float(p["rel_fro_mean"]) for p in pts]
 
             mk = marker_of(method, fallback_idx)
-            if method not in MARKERS:
+            if method not in marker_map:
                 fallback_idx += 1
 
             plt.plot(
-                xs, ys,
+                xs,
+                ys,
                 marker=mk,
-                markerfacecolor="none",   # unfilled marker
+                markerfacecolor="none",
                 markeredgewidth=1.5,
                 linewidth=1.8,
                 label=label_of(method),
             )
 
-        plt.xlabel("Parameter budget ~ (I+J)*R")
+        plt.xlabel("Parameter budget ~ (I+J)*B")
         plt.ylabel("Relative Frobenius error")
         plt.title(f"rel_fro vs budget (K_ratio={kr_key})")
         plt.grid(True, alpha=0.3)
-
-        # Ensure legend order already follows `methods` (MMF first)
-        handles, labels = plt.gca().get_legend_handles_labels()
-        # Optional: enforce ordering by labels (in case matplotlib reorders)
-        # We'll keep insertion order, which matches our plotting order.
-        plt.legend(handles, labels)
+        plt.legend()
 
         fn = os.path.join(out_dir, f"plot_rel_fro_vs_budget_Kratio{kr_key}.png")
         plt.savefig(fn, dpi=200, bbox_inches="tight")
         plt.close()
 
-    # ---------- (2) rel_fro vs K_ratio for each fixed R ----------
-    grp_R = defaultdict(list)
+    # (2) rel_fro vs K_ratio for each fixed R
+    grp_R: Dict[int, List[Dict[str, object]]] = defaultdict(list)
     for a in agg:
         grp_R[int(a["R"])].append(a)
 
     for R, items in sorted(grp_R.items(), key=lambda kv: kv[0]):
         plt.figure()
 
-        # MMF curve first (so it appears first in legend)
+        # MMF curve first (so it appears first in the legend)
         mmf_pts = [x for x in items if x["method"] == "MMF"]
         if mmf_pts:
-            mmf_pts = sorted(mmf_pts, key=lambda d: d["K_ratio"])
-            xs = [p["K_ratio"] for p in mmf_pts]
-            ys = [p["rel_fro_mean"] for p in mmf_pts]
+            mmf_pts = sorted(mmf_pts, key=lambda d: float(d["K_ratio"]))
+            xs = [float(p["K_ratio"]) for p in mmf_pts]
+            ys = [float(p["rel_fro_mean"]) for p in mmf_pts]
             plt.plot(
-                xs, ys,
-                marker=MARKERS.get("MMF", "o"),
+                xs,
+                ys,
+                marker=marker_map.get("MMF", "o"),
                 markerfacecolor="none",
                 markeredgewidth=1.5,
                 linewidth=1.8,
                 label=label_of("MMF"),
             )
 
-        # Baselines as horizontal lines (keep method ordering: MMF already drawn)
-        fallback_idx = 0
+        # Baselines as horizontal lines
         for method in methods:
             if method == "MMF":
                 continue
             pts = [x for x in items if x["method"] == method]
             if not pts:
                 continue
-            y = sum(p["rel_fro_mean"] for p in pts) / len(pts)
+            y = sum(float(p["rel_fro_mean"]) for p in pts) / len(pts)
             plt.hlines(y, xmin=0.0, xmax=1.0, linestyles="--", linewidth=1.5, label=label_of(method))
 
         plt.xlabel("K_ratio (=K/R)")
@@ -794,118 +1016,104 @@ def make_plots(rows: List[Dict[str, object]], out_dir: str):
         plt.title(f"rel_fro vs K_ratio (R={R})")
         plt.xlim(0.0, 1.0)
         plt.grid(True, alpha=0.3)
-
-        # Legend: MMF first already (plotted first)
-        handles, labels = plt.gca().get_legend_handles_labels()
-        plt.legend(handles, labels)
+        plt.legend()
 
         fn = os.path.join(out_dir, f"plot_rel_fro_vs_Kratio_R{R}.png")
         plt.savefig(fn, dpi=200, bbox_inches="tight")
         plt.close()
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Reconstruction experiments for MMF and baselines.")
 
-# -----------------------------
-# Main  # TODO
-# -----------------------------
-def main():
-    p = argparse.ArgumentParser()
+    # Matrix shape
+    p.add_argument("--I", type=int, default=1080, help="Number of rows.")
+    p.add_argument("--J", type=int, default=1080, help="Number of columns.")
 
-    # p.add_argument("--I", type=int, default=1024)
-    # p.add_argument("--J", type=int, default=1024)
+    # Sweeps
+    p.add_argument("--R", type=int, default=80, help="Vanilla MF rank (budget proxy).")
+    p.add_argument("--R_list", type=str, default="80,160,240", help="Comma-separated ranks, e.g., 16,32,64.")
+    p.add_argument("--K", type=int, default=40, help="Number of masks (used when K_ratio is not provided).")
+    p.add_argument("--K_ratio", type=float, default=0.4, help="If >=0, use K=round(K_ratio*R).")
+    p.add_argument("--K_ratio_list", type=str, default="", help="Comma-separated K_ratio values, e.g., 0.25,0.5,0.75.")
 
-    p.add_argument("--I", type=int, default=1080)
-    p.add_argument("--J", type=int, default=1080)  # For H
+    # Methods
+    p.add_argument(
+        "--methods",
+        type=str,
+        default="mmf,svd,mf_sgd,mf_ridge,mf_bias,nmf",
+        help="Comma-separated methods: mmf, svd, mf_sgd, mf_ridge, mf_bias, nmf.",
+    )
 
-    # sweeps
-    p.add_argument("--R", type=int, default=80)
-    # p.add_argument("--R_list", type=str, default="5, 10, 15, 20, 25, 30", help="Comma ranks, e.g., 16,32,64,80")
-    # p.add_argument("--R_list", type=str, default="10, 20, 30, 40, 50, 60", help="Comma ranks, e.g., 16,32,64,80")
-    # p.add_argument("--R_list", type=str, default="20, 40, 60, 80, 100, 120", help="Comma ranks, e.g., 16,32,64,80")
-    # p.add_argument("--R_list", type=str, default="40, 80, 120, 160, 200, 240", help="Comma ranks, e.g., 16,32,64,80")
-    # p.add_argument("--R_list", type=str, default="80, 160, 240, 320, 400, 480", help="Comma ranks, e.g., 16,32,64,80")
-    p.add_argument("--R_list", type=str, default="80, 160, 240, 320, 400, 480")
+    # Optimization
+    p.add_argument("--epochs", type=int, default=2000, help="Training epochs for gradient-based methods.")
+    p.add_argument("--log_every", type=int, default=200, help="Log every N epochs (0 to disable).")
 
-    p.add_argument("--K", type=int, default=40)
-    p.add_argument("--K_ratio", type=float, default=-1.0, help="If >=0, use K=round(K_ratio*R)")
-    # p.add_argument("--K_ratio_list", type=str, default="0.4, 0.6", help="Comma K_ratio, e.g., 0.25,0.5,0.75")
-    # p.add_argument("--K_ratio_list", type=str, default="0.75", help="Comma K_ratio, e.g., 0.25,0.5,0.75")
-    p.add_argument("--K_ratio_list", type=str, default="0.5", help="Comma K_ratio, e.g., 0.25,0.5,0.75")  # For H
+    p.add_argument("--lr_factors", type=float, default=2e-2, help="Learning rate for MMF factors (A,B).")
+    p.add_argument("--lr_shifts", type=float, default=1e-2, help="Learning rate for MMF shifts (uA,uB).")
 
-    # methods
-    p.add_argument("--methods", type=str, default="mmf,svd,mf_sgd,mf_ridge,mf_bias,nmf",
-                   help="Comma: mmf,svd,mf_sgd,mf_ridge,mf_bias,nmf")
-    # p.add_argument("--methods", type=str, default="mf_sgd,svd",
-    #                help="Comma: mmf,svd,mf_sgd,mf_ridge,mf_bias,nmf")
-    # p.add_argument("--methods", type=str, default="mmf",
-    #                help="Comma: mmf,svd,mf_sgd,mf_ridge,mf_bias,nmf")
+    p.add_argument("--lr_mf_sgd", type=float, default=2e-1, help="Learning rate for MF-SGD baseline.")
+    p.add_argument("--mf_sgd_momentum", type=float, default=0.999, help="Momentum for MF-SGD baseline.")
 
-    # training
-    p.add_argument("--epochs", type=int, default=2000)
-    p.add_argument("--print_every", type=int, default=200)
+    p.add_argument("--lr_mf_ridge", type=float, default=2e-2, help="Learning rate for MF-Ridge baseline.")
+    p.add_argument("--ridge_lambda", type=float, default=1e-3, help="Ridge coefficient for MF-Ridge baseline.")
 
-    p.add_argument("--lr_factors", type=float, default=2e-2)
-    p.add_argument("--lr_shifts", type=float, default=1e-2)
+    p.add_argument("--lr_mf_bias", type=float, default=2e-2, help="Learning rate for MF+Bias baseline.")
+    p.add_argument("--bias_ridge_lambda", type=float, default=0.0, help="Optional ridge for MF+Bias baseline.")
+    p.add_argument("--bias_rank_bonus", type=int, default=0, help="Optional rank bonus for MF+Bias.")
 
-    p.add_argument("--lr_mf_sgd", type=float, default=2e-1)  # TODO
-    p.add_argument("--mf_sgd_momentum", type=float, default=0.999)  # TODO
-    # 64: 2e-1 0.99
-    # 128: 3e-1 0.99
-    # 256: 1e-1 0.999   (4000)
-    # 512: 4e-1 0.999   (4000)
-    # 1024: 2e-1 0.999  (6000)
+    p.add_argument("--lr_nmf", type=float, default=2e-2, help="Learning rate for NMF baseline.")
 
-    p.add_argument("--lr_mf_ridge", type=float, default=2e-2)
-    p.add_argument("--ridge_lambda", type=float, default=1e-3)
+    # Mask configuration
+    p.add_argument("--mask_mode_A", type=str, default="gaussian", help="Mask family for rows (A).")
+    p.add_argument("--mask_mode_B", type=str, default="gaussian", help="Mask family for columns (B).")
+    p.add_argument("--mask_scale", type=float, default=-1.0, help="If >=0, override default mask scale (1/K).")
 
-    p.add_argument("--lr_mf_bias", type=float, default=2e-2)
-    p.add_argument("--bias_ridge_lambda", type=float, default=0.0)
-    p.add_argument("--bias_rank_bonus", type=int, default=0, help="Give MF+Bias +1 rank advantage if you want.")
-
-    p.add_argument("--lr_nmf", type=float, default=2e-2)
-
-    # mask  # TODO
-    p.add_argument("--mask_mode_A", type=str, default="sigmoid")
-    p.add_argument("--mask_mode_B", type=str, default="sigmoid")
-    p.add_argument("--mask_scale", type=float, default=-1)
-
-    # data
-    p.add_argument("--data_mode", type=str, default="blockdiag", choices=["random", "blockdiag"])  # TODO
+    # Data
+    p.add_argument("--data_mode", type=str, default="blockdiag", choices=["random", "blockdiag"])
     p.add_argument("--dist", type=str, default="normal", choices=["normal", "uniform"])
-    p.add_argument("--data_nonneg", action="store_true", help="Make X nonnegative for fair NMF.")
-    p.add_argument("--num_blocks", type=int, default=6)  # TODO
-    p.add_argument("--block_scale", type=float, default=1.0)
-    p.add_argument("--offblock_noise_scale", type=float, default=0.01)
+    p.add_argument("--data_nonneg", action="store_true", help="Make X nonnegative (useful for NMF).")
+    p.add_argument("--num_blocks", type=int, default=6, help="Number of blocks for block-diagonal data.")
+    p.add_argument("--block_scale", type=float, default=1.0, help="Scale for diagonal blocks.")
+    p.add_argument("--offblock_noise_scale", type=float, default=0.01, help="Noise scale for off-block entries.")
 
-    # scaling
-    p.add_argument("--x_target_fro", type=float, default=-1.0,
-                   help="If <0, target_fro=K (original). If set (e.g., 1.0), fixed scaling across K sweep.")
+    # Scaling
+    p.add_argument(
+        "--x_target_fro",
+        type=float,
+        default=-1.0,
+        help="If <0, set target Frobenius norm to K. Otherwise use the provided value.",
+    )
 
-    # misc
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--seeds", type=str, default="", help="Optional comma seeds, e.g., 0,1,2 (overrides --seed)")
+    # Misc
+    p.add_argument("--seed", type=int, default=42, help="Default random seed.")
+    p.add_argument("--seeds", type=str, default="", help="Optional comma-separated seeds (overrides --seed).")
+    p.add_argument("--deterministic", action="store_true", help="Enable deterministic algorithms in PyTorch.")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--tf32", action="store_true")
-    p.add_argument("--out_dir", type=str, default="out")
+    p.add_argument("--tf32", action="store_true", help="Allow TF32 matmul on Ampere+ GPUs (faster, slightly less precise).")
+    p.add_argument("--out_dir", type=str, default="out", help="Output directory for CSV/plots.")
+    p.add_argument("--no_plots", action="store_true", help="Disable plot generation.")
+    p.add_argument("--mpl_backend", type=str, default="Agg", help="Matplotlib backend (default: Agg).")
 
-    args = p.parse_args()
+    return p
 
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
     ensure_dir(args.out_dir)
 
-    device = args.device
-    if device.startswith("cuda") and args.tf32:
+    if args.device.startswith("cuda") and args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # seeds
-    seeds = parse_int_list(args.seeds)
-    if not seeds:
-        seeds = [args.seed]
+    # Seeds
+    seeds = parse_int_list(args.seeds) or [int(args.seed)]
 
     # R sweep list
-    R_list = parse_int_list(args.R_list)
-    if not R_list:
-        R_list = [args.R]
+    R_list = parse_int_list(args.R_list) or [int(args.R)]
 
     # K_ratio sweep list
     K_ratio_list = parse_float_list(args.K_ratio_list)
@@ -913,29 +1121,30 @@ def main():
         if args.K_ratio >= 0:
             K_ratio_list = [float(args.K_ratio)]
         else:
-            K_ratio_list = [None]  # means use fixed K
+            K_ratio_list = [float("nan")]  # sentinel: use fixed K
 
-    # methods
-    methods = parse_str_list(args.methods)
+    # Methods
+    methods = [m.lower() for m in parse_str_list(args.methods)]
     valid = {"mmf", "svd", "mf_sgd", "mf_ridge", "mf_bias", "nmf"}
     for m in methods:
         if m not in valid:
-            raise ValueError(f"Unknown method '{m}'. Valid: {sorted(list(valid))}")
+            raise ValueError(f"Unknown method '{m}'. Valid methods: {sorted(valid)}")
 
-    # data creation (once; shared across runs)
-    set_seed(seeds[0])
+    # Data creation (shared across runs)
+    set_global_seed(seeds[0], deterministic=args.deterministic)
     if args.data_mode == "random":
-        X = make_random_X(args.I, args.J, dist=args.dist, normalize="fro", seed=seeds[0], device=device)
+        X = make_random_X(args.I, args.J, dist=args.dist, normalize="fro", seed=seeds[0], device=args.device)
     else:
         X = make_block_diag_X(
-            args.I, args.J,
+            args.I,
+            args.J,
             num_blocks=args.num_blocks,
             dist=args.dist,
             block_scale=args.block_scale,
             offblock_noise_scale=args.offblock_noise_scale,
             normalize="fro",
             seed=seeds[0],
-            device=device,
+            device=args.device,
         )
 
     if args.data_nonneg:
@@ -943,46 +1152,50 @@ def main():
         X = X.clamp_min(0.0)
         X = _normalize_fro(X)
 
-    print(f"Device: {device}")
+    print(f"Device: {args.device}")
     print(f"Data: mode={args.data_mode}, dist={args.dist}, nonneg={args.data_nonneg}")
     print(f"Methods: {methods}")
     print(f"Output dir: {args.out_dir}")
 
     all_rows: List[Dict[str, object]] = []
 
-    # grid: for each (R, K_ratio) and each seed
+    # Grid: for each (R, K_ratio) and each seed
     for R in R_list:
         for kr in K_ratio_list:
-            if kr is None:
+            if math.isnan(kr):
                 K = int(args.K)
             else:
                 K = int(round(float(kr) * R))
-            K = max(1, min(K, R - 1))
+            # K must satisfy 1 <= K <= R-1 for R_base = R-K >= 1
+            K = max(1, min(K, int(R) - 1))
 
             for sd in seeds:
                 rows = run_one_setting(
                     X_orig=X,
-                    I=args.I,
-                    J=args.J,
-                    R=R,
-                    K=K,
+                    I=int(args.I),
+                    J=int(args.J),
+                    R=int(R),
+                    K=int(K),
                     args=args,
                     methods=methods,
-                    seed=sd,
+                    seed=int(sd),
                 )
                 all_rows.extend(rows)
 
-    # save csv
-    csv_path = os.path.join(args.out_dir, f"results_{args.I}_{args.data_mode}_{args.mask_mode_A}.csv")
+    # Save CSV
+    csv_name = f"results_I{args.I}_J{args.J}_{args.data_mode}_mask{args.mask_mode_A}-{args.mask_mode_B}.csv"
+    csv_path = os.path.join(args.out_dir, csv_name)
     save_csv(all_rows, csv_path)
     print(f"\nSaved CSV: {csv_path}")
 
-    # plots
-    make_plots(all_rows, args.out_dir)
-    print(f"Saved plots to: {args.out_dir}")
+    # Plots
+    if not args.no_plots:
+        try:
+            make_plots(all_rows, args.out_dir, backend=args.mpl_backend)
+            print(f"Saved plots to: {args.out_dir}")
+        except ModuleNotFoundError:
+            print("Matplotlib not found. Skipping plots. Install matplotlib or use --no_plots.")
 
-    # final text summary (best per setting by mean over seeds)
-    # (simple: just show per (R,K) sorted by rel_fro for seed=first if seeds>1; CSV has full detail)
     print("\nDone.")
 
 
