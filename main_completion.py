@@ -556,20 +556,14 @@ class MMF(nn.Module):
             return torch.cos(delta)
         if mode == "sigmoid":
             return 2.0 * torch.sigmoid(delta)
-        if mode == "linear":
-            return (delta / self.half + 1.0).clamp(0.0, 2.0)
         if mode == "sinc":
             return (torch.sinc(delta / math.pi) + 1) * 2 / 5
         if mode == "square":
             return torch.tanh(torch.sin(delta) / 0.1) + 1.0
-        if mode == "tri":
-            return (4 + (1.0 - 2.0 * torch.abs(torch.remainder(delta + 1, 2) - 1))) / 6
         if mode == "gaussian":
-            return 0.5 + torch.exp(-delta ** 2 / 2) / 2.507  # sqrt(2pi)
+            return 0.5 + torch.exp(-delta ** 2 / 2) / 2.507
         if mode == "cauchy":
             return 2 / (4 + delta ** 2) + 0.5
-        if mode == "linear01":
-            return (delta / (2.0 * self.half) + 0.5).clamp(0.0, 1.0)
         if mode == "sin01":
             return (torch.sin(delta) + 1.0) / 2.0
         if mode == "cos01":
@@ -609,9 +603,9 @@ class MMF(nn.Module):
         idx: (N,) indices (users or items)
         return: (N, R) mask
         """
-        u_shift = self._get_shift(which, k, idx)           # (N,)
-        s = self.half * u_shift                            # (N,)
-        delta = self.pos[None, :] - s[:, None]            # (N, R)
+        u_shift = self._get_shift(which, k, idx)     # (N,)
+        s = self.half * u_shift                      # (N,)
+        delta = self.pos[None, :] - s[:, None]       # (N, R)
         mask = self._mask_fn(delta * self.omega[k], mode) / self.K
         return mask
 
@@ -872,12 +866,8 @@ def main():
     p.set_defaults(use_bias=True)
 
     # mmf masks
-    p.add_argument("--mask_mode_A", type=str, default="gaussian",
-                   choices=["sigmoid", "linear", "sin", "cos", "gaussian", "sinc", "cauchy", "square", "triangle",
-                            "linear01", "sin01", "cos01", "psin", "pcos"])
-    p.add_argument("--mask_mode_B", type=str, default="gaussian",
-                   choices=["sigmoid", "linear", "sin", "cos", "gaussian", "sinc", "cauchy", "square", "triangle",
-                            "linear01", "sin01", "cos01", "psin", "pcos"])
+    p.add_argument("--mask_mode_A", type=str, default="gaussian")
+    p.add_argument("--mask_mode_B", type=str, default="gaussian")
 
     # optimization
     p.add_argument("--epochs", type=int, default=100)
