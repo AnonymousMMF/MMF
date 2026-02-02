@@ -12,5 +12,5 @@ python main_completion.py `
   --data_dir $dataDir `
   --save_dir $outDir `
   --device cuda `
-  --R 64 --K 3 `
+  --R 256 --K 42 `
   --epochs 50
